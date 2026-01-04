@@ -1,0 +1,132 @@
+\documentclass{beamer}
+\usepackage{amsmath}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\usetheme{Madrid}
+\setbeamertemplate{navigation symbols}{}
+
+\title{TQC and TOP-TQC Algorithms}
+\author{}
+\date{}
+
+\begin{document}
+
+% ============================================================================
+\begin{frame}{TQC: Truncated Quantile Critics}
+\vspace{-0.3cm}
+
+\textbf{Key Idea:} Distributional RL with truncated quantile ensemble to control overestimation.
+
+\vspace{0.3cm}
+
+\begin{algorithmic}[1]
+\STATE \textbf{Given:} state $s_t$, action $a_t$, reward $r_t$, next state $s_{t+1}$
+\STATE Sample next action: $a_{t+1}, \log\pi \sim \pi_\theta(s_{t+1})$
+\STATE \textcolor{blue}{Get quantiles from all critics:}
+\STATE \quad $Z_i^{(j)}(s_{t+1}, a_{t+1})$ for $i \in [1,\ldots,n_c]$, $j \in [1,\ldots,n_q]$
+\STATE \textcolor{red}{Concatenate \& sort:} $\mathcal{Z} = \text{sort}(\{Z_i^{(j)}\})$ \quad (size: $n_c \times n_q$)
+\STATE \textcolor{red}{Truncation:} $\hat{\mathcal{Z}} = \mathcal{Z}[1:n_c \times n_q - k]$ \quad (drop top $k$ quantiles)
+\STATE \textbf{Target:} $\mathcal{T} = \hat{\mathcal{Z}} - \alpha \log\pi$ \quad (entropy regularization)
+\STATE \textbf{Bellman update:} $\tau_j \leftarrow r_t + \gamma \mathcal{T}_j$ \quad $\forall j$
+\STATE Update each critic: $\mathcal{L} = \sum_i \rho_{\tau}(Z_i - \tau)$ \quad (quantile Huber loss)
+\end{algorithmic}
+
+\vspace{0.2cm}
+\textbf{Result:} Distributional targets with conservative bias (truncation).
+
+\end{frame}
+
+% ============================================================================
+\begin{frame}{TOP-TQC: Scalar Belief Mode}
+\vspace{-0.3cm}
+
+\textbf{Key Idea:} Apply TOP's adaptive optimism to TQC's conservative estimate via scalar collapse.
+
+\vspace{0.3cm}
+
+\begin{algorithmic}[1]
+\STATE \textbf{Given:} state $s_t$, action $a_t$, reward $r_t$, next state $s_{t+1}$
+\STATE \textcolor{orange}{Sample optimism:} $\beta \sim \text{Bandit}(\{-1, 0, 1\})$ \quad (Thompson sampling)
+\STATE Get quantiles from all critics: $Z_i^{(j)}(s_{t+1}, a_{t+1})$
+\STATE Concatenate \& sort: $\mathcal{Z} = \text{sort}(\{Z_i^{(j)}\})$
+\STATE \textcolor{red}{Truncation:} $\hat{\mathcal{Z}} = \mathcal{Z}[1:n_c \times n_q - k]$ \quad (conservative baseline)
+\STATE \textcolor{orange}{Collapse to scalar:}
+\STATE \quad $\mu = \frac{1}{|\hat{\mathcal{Z}}|}\sum_{j} \hat{\mathcal{Z}}_j$, \quad $\sigma = \text{std}(\hat{\mathcal{Z}})$
+\STATE \quad $\text{belief} = \mu + \beta \cdot \sigma$ \quad \textbf{(scalar optimism)}
+\STATE \textcolor{blue}{Replicate:} $\mathcal{T} = [\text{belief}, \text{belief}, \ldots, \text{belief}]$ \quad (size: $n_q$)
+\STATE \textbf{Bellman update:} $\tau_j \leftarrow r_t + \gamma \cdot \text{belief}$ \quad $\forall j$ \textbf{(same for all)}
+\STATE Update critics: $\mathcal{L} = \sum_i \rho_{\tau}(Z_i - \tau)$
+\STATE Update bandit based on episode performance
+\end{algorithmic}
+
+\vspace{0.1cm}
+\textbf{Trade-off:} Adaptive exploration, but \textcolor{red}{loses distributional shape} (all targets identical).
+
+\end{frame}
+
+% ============================================================================
+\begin{frame}{TOP-TQC: Distributional Mode}
+\vspace{-0.3cm}
+
+\textbf{Key Idea:} Apply TOP's optimism while preserving the full return distribution.
+
+\vspace{0.3cm}
+
+\begin{algorithmic}[1]
+\STATE \textbf{Given:} state $s_t$, action $a_t$, reward $r_t$, next state $s_{t+1}$
+\STATE \textcolor{orange}{Sample optimism:} $\beta \sim \text{Bandit}(\{-1, 0, 1\})$
+\STATE Get quantiles from all critics: $Z_i^{(j)}(s_{t+1}, a_{t+1})$
+\STATE Concatenate \& sort: $\mathcal{Z} = \text{sort}(\{Z_i^{(j)}\})$
+\STATE \textcolor{red}{Truncation:} $\hat{\mathcal{Z}} = \mathcal{Z}[1:n_c \times n_q - k]$ \quad (size: $m$)
+\STATE \textcolor{orange}{Compute uncertainty:} $\sigma = \text{std}(\hat{\mathcal{Z}})$
+\STATE \textcolor{blue}{Shift distribution:} $\tilde{\mathcal{Z}} = \hat{\mathcal{Z}} + \beta \cdot \sigma$ \quad \textbf{(uniform shift)}
+\STATE \quad \textit{(preserves relative spacing between quantiles)}
+\STATE \textcolor{blue}{Resample:} Interpolate $\tilde{\mathcal{Z}}$ to $n_q$ quantiles $\rightarrow \mathcal{T}$
+\STATE \textbf{Bellman update:} $\tau_j \leftarrow r_t + \gamma \mathcal{T}_j$ \quad $\forall j$ \textbf{(each distinct)}
+\STATE Update critics: $\mathcal{L} = \sum_i \rho_{\tau}(Z_i - \tau)$
+\STATE Update bandit based on episode performance
+\end{algorithmic}
+
+\vspace{0.1cm}
+\textbf{Result:} \textcolor{blue}{Distributional Bellman backup} with adaptive optimism control.
+
+\end{frame}
+
+% ============================================================================
+\begin{frame}{Summary Comparison}
+
+\begin{table}
+\centering
+\small
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Property} & \textbf{TQC} & \textbf{TOP-TQC Scalar} & \textbf{TOP-TQC Dist.} \\
+\hline
+Truncation & \checkmark & \checkmark & \checkmark \\
+\hline
+Distributional targets & \checkmark & \textcolor{red}{\texttimes} & \checkmark \\
+\hline
+Adaptive optimism & \textcolor{red}{\texttimes} & \checkmark & \checkmark \\
+\hline
+Bandit learning & \textcolor{red}{\texttimes} & \checkmark & \checkmark \\
+\hline
+Target complexity & Medium & Low & High \\
+\hline
+Stability & High & High & Medium \\
+\hline
+\end{tabular}
+\end{table}
+
+\vspace{0.5cm}
+
+\textbf{Key Equations:}
+\begin{itemize}
+    \item TQC target: $\tau_j = r + \gamma \hat{\mathcal{Z}}_j$
+    \item TOP-TQC Scalar: $\tau_j = r + \gamma (\mu + \beta\sigma)$ \quad \textit{(all $j$ same)}
+    \item TOP-TQC Dist.: $\tau_j = r + \gamma (\hat{\mathcal{Z}}_j + \beta\sigma)$ \quad \textit{(each $j$ distinct)}
+\end{itemize}
+
+\end{frame}
+
+\end{document}
