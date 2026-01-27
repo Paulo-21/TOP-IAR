@@ -31,37 +31,39 @@ import os
 
 # Define all experiments
 ALGORITHMS = {
-    'sac': {
+    # === CleanRL Baselines (for comparison, but not recommended - use SB3 instead) ===
+    'sac_cleanrl': {
         'script': 'sac.py',
-        'description': 'Soft Actor-Critic',
+        'description': 'SAC (CleanRL - not tuned)',
         'args': {
             '--total_timesteps': '1000000'
         },
-        'env_arg': '--env_id'  # SAC uses --env_id
+        'env_arg': '--env_id'
     },
-    'td3': {
+    'td3_cleanrl': {
         'script': 'td3.py',
-        'description': 'Twin Delayed DDPG',
+        'description': 'TD3 (CleanRL - not tuned)',
         'args': {
             '--total_timesteps': '1000000'
         },
-        'env_arg': '--env_id'  # TD3 uses --env_id
+        'env_arg': '--env_id'
     },
-    'tqc': {
+    'tqc_cleanrl': {
         'script': 'tqc.py',
-        'description': 'Truncated Quantile Critics',
+        'description': 'TQC (CleanRL - not tuned)',
         'args': {
             '--n_quantiles': '25',
             '--n_critics': '5',
             '--top_quantiles_to_drop': '2',
             '--total_timesteps': '1000000'
         },
-        'env_arg': '--env_id'  # TQC uses --env_id
+        'env_arg': '--env_id'
     },
-    # === Stable Baselines3 Baselines ===
-    'sb3_td3': {
+    
+    # === Stable Baselines3 Baselines (RECOMMENDED - properly tuned) ===
+    'td3': {
         'script': 'sb3_td3.py',
-        'description': 'SB3 TD3 (RL Zoo hyperparameters)',
+        'description': 'TD3 (SB3 with RL Zoo hyperparameters)',
         'args': {
             '--total_timesteps': '1000000',
             '--log_interval': '10000',
@@ -69,9 +71,9 @@ ALGORITHMS = {
         },
         'env_arg': '--env_id'
     },
-    'sb3_sac': {
+    'sac': {
         'script': 'sb3_sac.py',
-        'description': 'SB3 SAC (RL Zoo hyperparameters)',
+        'description': 'SAC (SB3 with RL Zoo hyperparameters)',
         'args': {
             '--total_timesteps': '1000000',
             '--log_interval': '10000',
@@ -79,9 +81,9 @@ ALGORITHMS = {
         },
         'env_arg': '--env_id'
     },
-    'sb3_tqc': {
+    'tqc': {
         'script': 'sb3_tqc.py',
-        'description': 'SB3 TQC (RL Zoo hyperparameters)',
+        'description': 'TQC (SB3 with RL Zoo hyperparameters)',
         'args': {
             '--total_timesteps': '1000000',
             '--log_interval': '10000',
@@ -90,11 +92,12 @@ ALGORITHMS = {
         'env_arg': '--env_id'
     },
     
-    # === TOP Variants ===
-    'top': {
-        'script': 'mujoco/train_top_agent.py',
-        'description': 'TOP with quantile critics',
+    # === TOP Variants (SAC-based with distributional critics) ===
+    'top_sac': {
+        'script': 'mujoco/train_top_sac.py',
+        'description': 'TOP-SAC with bandit-controlled beta (state-based SAC)',
         'args': {
+            '--train_steps': '1000000',
             '--n_quantiles': '50',
             '--bandit_lr': '0.1',
             '--log_interval': '10000',
@@ -102,32 +105,11 @@ ALGORITHMS = {
         },
         'env_arg': '--env'
     },
-    'top_beta_optimistic': {
-        'script': 'mujoco/train_top_agent.py',
-        'description': 'TOP (optimistic) with fixed beta=0',
-        'args': {
-            '--n_quantiles': '50',
-            '--bandit_lr': '0.1',
-            '--beta': '0',
-            '--fixed_beta': ''
-        },
-        'env_arg': '--env'
-    },
-    'top_beta_pessimistic': {
-        'script': 'mujoco/train_top_agent.py',
-        'description': 'TOP (pessimistic) with fixed beta=-1',
-        'args': {
-            '--n_quantiles': '50',
-            '--bandit_lr': '0.1',
-            '--beta': '-1',
-            '--fixed_beta': ''
-        },
-        'env_arg': '--env'
-    },
     'top_learnable': {
         'script': 'mujoco/train_top_agent.py',
-        'description': 'TOP with learnable beta',
+        'description': 'TOP-SAC with learnable beta parameter',
         'args': {
+            '--train_steps': '1000000',
             '--n_quantiles': '50',
             '--bandit_lr': '0.1',
             '--learnable_beta': '',
@@ -138,35 +120,133 @@ ALGORITHMS = {
         },
         'env_arg': '--env'
     },
+    'top_learnable_beta_neg1': {
+        'script': 'mujoco/train_top_agent.py',
+        'description': 'TOP-SAC with learnable beta (init=-1)',
+        'args': {
+            '--train_steps': '1000000',
+            '--n_quantiles': '50',
+            '--bandit_lr': '0.1',
+            '--learnable_beta': '',
+            '--beta': '-1',
+            '--beta_lr': '3e-4',
+            '--log_interval': '10000',
+            '--n_evals': '5'
+        },
+        'env_arg': '--env'
+    },
+    'top_optimist': {
+        'script': 'mujoco/train_top_agent.py',
+        'description': 'TOP-SAC with fixed optimistic beta=0',
+        'args': {
+            '--train_steps': '1000000',
+            '--n_quantiles': '50',
+            '--beta': '0',
+            '--fixed_beta': '',
+            '--log_interval': '10000',
+            '--n_evals': '5'
+        },
+        'env_arg': '--env'
+    },
+    'top_pessimist': {
+        'script': 'mujoco/train_top_agent.py',
+        'description': 'TOP-SAC with fixed pessimistic beta=-1',
+        'args': {
+            '--train_steps': '1000000',
+            '--n_quantiles': '50',
+            '--beta': '-1',
+            '--fixed_beta': '',
+            '--log_interval': '10000',
+            '--n_evals': '5'
+        },
+        'env_arg': '--env'
+    },
+    
+    # === Classical TOP Variant ===
+    'top': {
+        'script': 'mujoco/train_top_agent.py',
+        'description': 'Classical TOP with bandit-controlled optimism',
+        'args': {
+            '--train_steps': '1000000',
+            '--n_quantiles': '50',
+            '--bandit_lr': '0.1',
+            '--beta': '0.0',
+            '--log_interval': '10000',
+            '--n_evals': '5'
+        },
+        'env_arg': '--env'
+    },
+    
+    # === TOP-TQC Variants ===
     'top_tqc': {
         'script': 'mujoco/train_top_tqc.py',
-        'description': 'TOP-TQC hybrid',
+        'description': 'TOP-TQC hybrid (TOP + TQC truncation)',
         'args': {
-            '--n_quantiles': '25',
+            '--train_steps': '1000000',
+            '--n_quantiles': '50',
             '--n_critics': '5',
-            '--top_quantiles_to_drop': '2',
+            '--top_quantiles_to_drop': '4',
             '--bandit_lr': '0.1',
             '--log_interval': '10000',
             '--n_evals': '5'
         },
         'env_arg': '--env'
     },
-    # 'top_td3': {
-    #     'script': 'mujoco/train_top_td3.py',
-    #     'description': 'TOP-TD3 (distributional)',
-    #     'args': {
-    #         '--n_quantiles': '100',
-    #         '--bandit_lr': '0.1',
-    #         '--beta': '0.0',
-    #         '--log_interval': '10000',
-    #         '--n_evals': '5'
-    #     },
-    #     'env_arg': '--env'
-    # },
+    'top_tqc_learnable': {
+        'script': 'mujoco/train_top_tqc.py',
+        'description': 'TOP-TQC with learnable beta parameter',
+        'args': {
+            '--train_steps': '1000000',
+            '--n_quantiles': '50',
+            '--n_critics': '5',
+            '--top_quantiles_to_drop': '4',
+            '--bandit_lr': '0.1',
+            '--learnable_beta': '',
+            '--beta': '0',
+            '--beta_lr': '3e-4',
+            '--log_interval': '10000',
+            '--n_evals': '5'
+        },
+        'env_arg': '--env'
+    },
+    'top_tqc_learnable_beta_neg1': {
+        'script': 'mujoco/train_top_tqc.py',
+        'description': 'TOP-TQC with learnable beta (init=-1)',
+        'args': {
+            '--train_steps': '1000000',
+            '--n_quantiles': '50',
+            '--n_critics': '5',
+            '--top_quantiles_to_drop': '4',
+            '--bandit_lr': '0.1',
+            '--learnable_beta': '',
+            '--beta': '-1',
+            '--beta_lr': '3e-4',
+            '--log_interval': '10000',
+            '--n_evals': '5'
+        },
+        'env_arg': '--env'
+    },
+    'top_tqc_learnable_quantiles': {
+        'script': 'mujoco/train_top_tqc_learnable_drop.py',
+        'description': 'TOP-TQC with learnable quantile dropping',
+        'args': {
+            '--train_steps': '1000000',
+            '--n_quantiles': '50',
+            '--n_critics': '5',
+            '--top_quantiles_to_drop': '4',
+            '--beta': '0.0',
+            '--bandit_lr': '0.1',
+            '--learnable_drop': '',
+            '--drop_lr': '3e-4',
+            '--log_interval': '10000',
+            '--n_evals': '5'
+        },
+        'env_arg': '--env'
+    },
 }
 
 ENVIRONMENTS = ['HalfCheetah-v5', 'Hopper-v5']
-SEEDS = [1, 2, 3]
+SEEDS = [1, 2, 3, 4, 5]
 
 
 def generate_experiments() -> List[Dict]:

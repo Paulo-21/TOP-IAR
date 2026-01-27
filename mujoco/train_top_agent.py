@@ -60,8 +60,8 @@ def train_agent_model_free(agent: TOP_Agent, env, params: Dict) -> None:
     com = f"{algo_name}_{env_name}_nq{params['n_quantiles']}_{params['bandit_lr']}_seed{seed}"
     # prefer provided save_dir (from run_experiments). Otherwise use runs/<algorithm>/<env>/<seed>/id_<ts>
     if params.get('save_dir'):
-        # when a save_dir is provided, use it directly as the run directory
-        run_dir = params.get('save_dir')
+        # when a save_dir is provided, append seed folder to it
+        run_dir = os.path.join(params.get('save_dir'), f"seed_{seed}")
         os.makedirs(run_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=run_dir)
     else:
@@ -70,8 +70,9 @@ def train_agent_model_free(agent: TOP_Agent, env, params: Dict) -> None:
         writer = SummaryWriter(log_dir=os.path.join(run_dir, 'tensorboard'))
 
     prev_episode_reward = 0
-    with tqdm(total=int(1e6), desc="Training TOP") as pbar:
-        while samples_number < 1e6:
+    train_steps = int(params.get('train_steps', int(1e6)))
+    with tqdm(total=train_steps, desc="Training TOP") as pbar:
+        while samples_number < train_steps:
             time_step = 0
             episode_reward = 0
             i_episode += 1
@@ -166,10 +167,24 @@ def train_agent_model_free(agent: TOP_Agent, env, params: Dict) -> None:
             except Exception:
                 pass
 
-            # update bandit parameters (only when using bandit, not for learnable_beta)
+            # Update bandit (for non-learnable beta)
+            feedback = episode_reward - prev_episode_reward
             if not agent.learnable_beta:
-                feedback = episode_reward - prev_episode_reward
                 agent.TDC.update_dists(feedback)
+            
+            # For learnable beta: meta-learning from episode returns
+            if agent.learnable_beta:
+                # Use running average as baseline for variance reduction
+                if len(episode_rewards) > 10:
+                    baseline = np.mean(episode_rewards[-10:])
+                else:
+                    baseline = 0.0
+                agent.update_beta_from_return(episode_reward, baseline)
+                
+                # Log current beta value
+                current_beta = agent.get_beta(detach=True)
+                writer.add_scalar('Params/Beta', current_beta, cumulative_timestep)
+            
             prev_episode_reward = episode_reward
 
     # close writer to flush tensorboard events
@@ -216,6 +231,7 @@ def main():
     parser.add_argument('--beta', type=float, default=0.0)
     parser.add_argument('--beta_lr', type=float, default=3e-4)
     parser.add_argument('--fixed_beta', dest='fixed_beta', action='store_true', help='Use fixed beta (single-arm bandit)')
+    parser.add_argument('--train_steps', type=int, default=1000000, help='Total number of environment steps to collect')
     parser.set_defaults(obs_filter=False)
     parser.set_defaults(save_model=False)
     parser.set_defaults(learnable_beta=False)

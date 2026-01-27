@@ -1,5 +1,6 @@
 import random
 from argparse import ArgumentParser
+import sys
 import os
 from collections import deque
 
@@ -59,8 +60,8 @@ def train_agent_model_free(agent: TOP_TQC_Agent, env, params: Dict) -> None:
     env_name = params.get('env') or params.get('env_id')
     com = f"{algo_name}_{env_name}_nq{params['n_quantiles']}_nc{params['n_critics']}_drop{params['top_quantiles_to_drop']}_beta{params['bandit_lr']}_seed{seed}"
     if params.get('save_dir'):
-        # when a save_dir is provided, use it directly as the run directory
-        run_dir = params.get('save_dir')
+        # when a save_dir is provided, append seed folder to it
+        run_dir = os.path.join(params.get('save_dir'), f"seed_{seed}")
         os.makedirs(run_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=run_dir)
     else:
@@ -69,8 +70,9 @@ def train_agent_model_free(agent: TOP_TQC_Agent, env, params: Dict) -> None:
         writer = SummaryWriter(log_dir=os.path.join(run_dir, 'tensorboard'))
 
     prev_episode_reward = 0
-    with tqdm(total=int(1e6), desc="Training TOP-TQC") as pbar:
-        while samples_number < 1e6:
+    train_steps = int(params.get('train_steps', int(1e6)))
+    with tqdm(total=train_steps, desc="Training TOP-TQC") as pbar:
+        while samples_number < train_steps:
             time_step = 0
             episode_reward = 0
             i_episode += 1
@@ -157,10 +159,21 @@ def train_agent_model_free(agent: TOP_TQC_Agent, env, params: Dict) -> None:
             episode_steps.append(time_step)
             episode_rewards.append(episode_reward)
 
-            # update bandit parameters (only when using bandit, not for learnable_beta)
+            # Update bandit (for non-learnable beta)
+            feedback = episode_reward - prev_episode_reward
             if not agent.learnable_beta:
-                feedback = episode_reward - prev_episode_reward
                 agent.TDC.update_dists(feedback)
+            
+            # For learnable beta: meta-learning from episode returns
+            if agent.learnable_beta:
+                if len(episode_rewards) > 10:
+                    baseline = np.mean(episode_rewards[-10:])
+                else:
+                    baseline = 0.0
+                agent.update_beta_from_return(episode_reward, baseline)
+                current_beta = agent.get_beta(detach=True)
+                writer.add_scalar('Params/Beta', current_beta, cumulative_timestep)
+            
             prev_episode_reward = episode_reward
 
             # Log per-episode reward to TensorBoard (match CleanRL-style logging)
@@ -207,9 +220,9 @@ def main():
     parser.add_argument('--n_collect_steps', type=int, default=1000)
     parser.add_argument('--n_evals', type=int, default=1)
     parser.add_argument('--save_model', dest='save_model', action='store_true')
-    parser.add_argument('--n_quantiles', type=int, default=25)
+    parser.add_argument('--n_quantiles', type=int, default=50)
     parser.add_argument('--n_critics', type=int, default=5)
-    parser.add_argument('--top_quantiles_to_drop', type=int, default=2)
+    parser.add_argument('--top_quantiles_to_drop', type=int, default=4)
     parser.add_argument('--bandit_lr', type=float, default=0.1)
     parser.add_argument('--learnable_beta', dest='learnable_beta', action='store_true')
     parser.add_argument('--beta', type=float, default=0.0)
@@ -217,6 +230,7 @@ def main():
     parser.add_argument('--preserve_distribution', dest='preserve_distribution', action='store_true',
                         help='If set, applies optimism to distribution directly instead of collapsing to scalar')
     parser.add_argument('--log_interval', type=int, default=1000, help='Step interval for periodic logging/evaluation')
+    parser.add_argument('--train_steps', type=int, default=1000000, help='Total number of environment steps to collect')
     parser.add_argument('--save_dir', type=str, default=None, help='Directory to write logs/checkpoints for this run')
     parser.add_argument('--algorithm', type=str, default=None, help='Algorithm name (used to name run folders)')
     parser.set_defaults(obs_filter=False)
@@ -225,6 +239,16 @@ def main():
     parser.set_defaults(preserve_distribution=False)
 
     args = parser.parse_args()
+
+    # If the user did not explicitly provide --top_quantiles_to_drop on the CLI,
+    # set sensible environment-specific defaults.
+    # Hopper tends to need more truncation (per-critic drops = 5), otherwise use 4.
+    if '--top_quantiles_to_drop' not in sys.argv:
+        if 'Hopper' in args.env:
+            args.top_quantiles_to_drop = 10
+        else:
+            args.top_quantiles_to_drop = 4
+
     params = vars(args)
 
     seed = params['seed']

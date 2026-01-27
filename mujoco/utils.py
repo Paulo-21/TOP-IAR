@@ -45,15 +45,80 @@ class MeanStdevFilter():
         return (x * self.stdev) + self.mean
 
 
+class RunningMeanStd:
+    """Lightweight RunningMeanStd compatible with SB3's API.
+
+    Provides `update()` to accumulate statistics and `__call__()` to
+    normalize observations. Keeps stats in float64 for stability.
+    """
+    def __init__(self, shape=(), eps: float = 1e-8):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = eps
+        self.eps = eps
+
+    def update(self, x: np.ndarray) -> None:
+        x = np.array(x, dtype=np.float64)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+
+    def _update_from_moments(self, batch_mean: np.ndarray, batch_var: np.ndarray, batch_count: int) -> None:
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * (self.count * batch_count / tot_count)
+
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        arr = np.array(x)
+        if arr.ndim == 1:
+            return (arr - self.mean) / (np.sqrt(self.var) + self.eps)
+        # handle list/tuple of observations (e.g., samples.state)
+        arr = np.array(arr)
+        return (arr - self.mean) / (np.sqrt(self.var) + self.eps)
+
+    @property
+    def std(self) -> np.ndarray:
+        return np.sqrt(self.var + self.eps)
+
+
 class ReplayPool:
 
     def __init__(self, capacity: int = int(1e6)) -> None:
         self.capacity = int(capacity)
         self._memory = deque(maxlen=int(capacity))
         
-    def push(self, transition: Transition) -> None:
-        """ Saves a transition """
-        self._memory.append(transition)
+    def push(self, *args) -> None:
+        """Saves a transition.
+
+        Usage:
+        - `push(transition)` where `transition` is a `Transition` instance, or
+        - `push(state, action, reward, nextstate, real_done[, prev_reward, arm])`
+        """
+        if len(args) == 1 and isinstance(args[0], Transition):
+            t = args[0]
+        else:
+            # Construct Transition from provided components. Missing optional
+            # trailing fields will be filled with defaults defined on the
+            # namedtuple.
+            t = Transition(*args)
+
+        self._memory.append(t)
         
     def sample(self, batch_size: int, unique: bool = True) -> Transition:
         transitions = random.sample(self._memory, batch_size) if unique else random.choices(self._memory, k=batch_size)
@@ -178,4 +243,3 @@ def compute_wd_quantile(q1: torch.Tensor, q2: torch.Tensor, gamma: float = 1.0) 
     wd = torch.pow(torch.sum(torch.pow(torch.abs(q1 - q2), gamma)), 1 / gamma)
     wd = wd.mean()
     return wd
-

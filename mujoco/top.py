@@ -79,12 +79,13 @@ class TOP_Agent:
         
         # Beta parameter (optimism)
         self.learnable_beta = learnable_beta
-        self.beta_min = -10.0  # Prevent extreme pessimism
-        self.beta_max = 10.0   # Prevent extreme optimism (prevents NaN)
+        self.beta_min = -5.0   # Prevent extreme pessimism
+        self.beta_max = 5.0    # Prevent extreme optimism
         if learnable_beta:
-            # Initialize log_beta (beta will be clamped after exp)
-            self.log_beta = torch.tensor([np.log(max(abs(beta) + 1e-8, 1e-8))], requires_grad=True, device=device)
-            self.beta_optimizer = torch.optim.Adam([self.log_beta], lr=beta_lr)
+            # Use direct parameterization (not log) with small random init for exploration
+            init_val = beta + np.random.uniform(-0.1, 0.1)
+            self.beta_param = torch.tensor([init_val], requires_grad=True, device=device)
+            self.beta_optimizer = torch.optim.Adam([self.beta_param], lr=beta_lr)
         else:
             self.beta = beta
 
@@ -121,20 +122,58 @@ class TOP_Agent:
         self.replay_pool = ReplayPool(capacity=int(buffer_size))
 
         self._update_counter = 0
+        
+        # For learnable beta: track episode history for meta-learning
+        self.beta_episode_history = []  # list of (beta_value, episode_return) tuples
+        self.beta_history_maxlen = 100  # keep last 100 episodes
+
+    def update_beta_from_return(self, episode_return: float, baseline: float = 0.0):
+        """Update learnable beta based on episode return (meta-learning)
+        
+        Args:
+            episode_return: Total reward from episode
+            baseline: Running average of returns for variance reduction
+        """
+        if not self.learnable_beta:
+            return
+        
+        # Get current beta (with gradient)
+        current_beta = self.get_beta(detach=False)
+        
+        # Advantage: how much better was this episode than average
+        advantage = episode_return - baseline
+        
+        # REINFORCE-style update: gradient is beta * advantage
+        # If advantage > 0, current beta was good, reinforce it
+        # If advantage < 0, current beta was bad, move away from it
+        meta_loss = -current_beta * advantage
+        
+        self.beta_optimizer.zero_grad()
+        meta_loss.backward()
+        torch.nn.utils.clip_grad_norm_([self.beta_param], max_norm=1.0)
+        self.beta_optimizer.step()
+        
+        # Track history
+        self.beta_episode_history.append((current_beta.item(), episode_return))
+        if len(self.beta_episode_history) > self.beta_history_maxlen:
+            self.beta_episode_history.pop(0)
 
     def get_beta(self, detach: bool = True):
         """Get the current beta value
         
         Args:
-            detach: if True, return float for logging; if False, return tensor for gradient
+            detach: if True, returns Python float; if False, returns tensor with gradient
         
         Returns:
-            float or torch.Tensor: current beta value (clamped to prevent explosion)
+            float or torch.Tensor: current beta value
         """
         if self.learnable_beta:
-            # Clamp beta to reasonable range to prevent NaN/explosion
-            beta_tensor = torch.clamp(torch.exp(self.log_beta), self.beta_min, self.beta_max)
-            return beta_tensor.item() if detach else beta_tensor
+            # Clamp to reasonable range
+            beta_clamped = torch.clamp(self.beta_param, self.beta_min, self.beta_max)
+            if detach:
+                return beta_clamped.item()
+            else:
+                return beta_clamped
         else:
             return self.beta
 
@@ -257,9 +296,15 @@ class TOP_Agent:
         eps1, eps2 = 1e-4, 1.1e-4 # small constants for stability 
         sigma = torch.sqrt((torch.pow(quantiles_b1 + eps1 - mu, 2) + torch.pow(quantiles_b2 + eps2 - mu, 2)) + eps1) 
         belief_dist = mu + beta * sigma # [batch_size, n_quantiles] - beta keeps gradient if tensor
-        # DPG loss
+        # DPG loss - use mean belief for policy gradient
         qval_batch = torch.mean(belief_dist, axis=-1)
         policy_loss = (-qval_batch).mean()
+        
+        # Add regularization for learnable beta to prevent extreme values
+        if self.learnable_beta and not isinstance(beta, float):
+            beta_reg = 0.01 * (beta ** 2)  # L2 penalty on beta
+            policy_loss = policy_loss + beta_reg
+        
         return policy_loss
 
     def optimize(
@@ -329,33 +374,15 @@ class TOP_Agent:
                 for p in self.q_funcs.parameters():
                     p.requires_grad = False
                     
-                # Get current beta for policy update (keep gradient if learnable!)
-                policy_beta = self.get_beta(detach=False) if self.learnable_beta else beta
+                # Always use detached beta for policy update to avoid perverse incentive
+                # (beta increasing makes Q look larger without actually improving policy)
+                policy_beta = self.get_beta(detach=True)
                 pi_loss_step = self.update_policy(state_batch, policy_beta)
                 
                 self.policy_optimizer.zero_grad()
-                # Also zero beta optimizer if learnable
-                if self.learnable_beta:
-                    self.beta_optimizer.zero_grad()
-                    
                 pi_loss_step.backward()
-                # Clip gradients to prevent explosion
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
-                if self.learnable_beta:
-                    torch.nn.utils.clip_grad_norm_([self.log_beta], max_norm=1.0)
-                
                 self.policy_optimizer.step()
-                
-                # Update beta if learnable (check for NaN)
-                if self.learnable_beta:
-                    if torch.isnan(pi_loss_step) or torch.isinf(pi_loss_step):
-                        print(f"WARNING: NaN/Inf in policy loss at update {self._update_counter}. Skipping beta update.")
-                    else:
-                        self.beta_optimizer.step()
-                        # Log warning if beta is hitting limits
-                        current_beta_val = self.get_beta(detach=True)
-                        if abs(current_beta_val - self.beta_max) < 0.1 or abs(current_beta_val - self.beta_min) < 0.1:
-                            print(f"WARNING: Beta near limit: {current_beta_val:.4f} (range: [{self.beta_min}, {self.beta_max}])")
                     
                 for p in self.q_funcs.parameters():
                     p.requires_grad = True

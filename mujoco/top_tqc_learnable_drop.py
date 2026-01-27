@@ -1,5 +1,5 @@
-# TOP-TQC: Combining TOP (Thompson Sampling Over Pessimism) with TQC (Truncated Quantile Critics)
-# This combines the optimism control from TOP with the truncated quantile approach from TQC
+# TOP-TQC with Learnable Quantile Dropping
+# Instead of learning beta (optimism), this learns how many quantiles to drop for conservatism
 
 import copy
 import numpy as np
@@ -71,7 +71,7 @@ class Policy(torch.nn.Module):
         return x
 
 
-class TOP_TQC_Agent:
+class TOP_TQC_LearnableDrop_Agent:
     def __init__(
         self,
         seed: int,
@@ -94,36 +94,15 @@ class TOP_TQC_Agent:
         kappa: float = 1.0,
         beta: float = 0.0,
         bandit_lr: float = 0.1,
-        learnable_beta: bool = False,
-        beta_lr: float = 3e-4,
-        preserve_distribution: bool = False
+        learnable_drop: bool = False,
+        drop_lr: float = 3e-4
     ) -> None:
         """
-        Initialize TOP-TQC agent combining TOP optimism with TQC truncation.
+        Initialize TOP-TQC agent with learnable quantile dropping.
 
         Args:
-            seed (int): random seed
-            state_dim (int): state dimension
-            action_dim (int): action dimension
-            action_lim (int): max action value
-            lr (float): learning rate
-            gamma (float): discount factor
-            tau (float): mixing rate for target nets
-            batchsize (int): batch size
-            hidden_size (int): hidden layer size
-            update_interval (int): delay for actor, target updates
-            buffer_size (int): size of replay buffer
-            target_noise (float): smoothing noise for target action
-            target_noise_clip (float): limit for target
-            explore_noise (float): noise for exploration
-            n_quantiles (int): number of quantiles per critic
-            n_critics (int): number of critic networks
-            top_quantiles_to_drop (int): number of top quantiles to drop
-            kappa (float): constant for Huber loss
-            beta (float): initial optimism parameter
-            bandit_lr (float): bandit learning rate
-            learnable_beta (bool): whether to make beta learnable
-            beta_lr (float): learning rate for beta if learnable
+            learnable_drop (bool): whether to make the number of dropped quantiles learnable
+            drop_lr (float): learning rate for drop parameter if learnable
         """
         self.gamma = gamma
         self.tau = tau
@@ -137,17 +116,21 @@ class TOP_TQC_Agent:
 
         torch.manual_seed(seed)
         
-        # Beta parameter (optimism)
-        self.learnable_beta = learnable_beta
-        self.beta_min = -5.0
-        self.beta_max = 5.0
-        if learnable_beta:
-            # Use direct parameterization with small random init
-            init_val = beta + np.random.uniform(-0.1, 0.1)
-            self.beta_param = torch.tensor([init_val], requires_grad=True, device=device)
-            self.beta_optimizer = torch.optim.Adam([self.beta_param], lr=beta_lr)
+        # Learnable drop parameter (how many quantiles to drop)
+        self.learnable_drop = learnable_drop
+        self.n_critics = n_critics
+        if learnable_drop:
+            # Start with initial drop count
+            self.current_drop_count = top_quantiles_to_drop * n_critics
+            # Bandit for adjusting drop count: arms = [-1, 0, +1] (remove drop, stay, add drop)
+            self.drop_bandit = ExpWeights(arms=[-1, 0, 1], lr=drop_lr, init=0.0, use_std=True)
+            # Bounds: drop at least 0, at most 50% of total quantiles
+            self.min_drop_count = 0
+            self.max_drop_count = int(0.5 * n_quantiles * n_critics)
         else:
-            self.beta = beta
+            self.top_quantiles_to_drop = top_quantiles_to_drop
+        
+        self.beta = beta  # Fixed beta for optimism
 
         # TQC critics
         self.q_funcs = TQCCritics(state_dim, action_dim, n_quantiles, n_critics, hidden_size).to(device)
@@ -164,10 +147,7 @@ class TOP_TQC_Agent:
 
         # TQC parameters
         self.n_quantiles = n_quantiles
-        self.n_critics = n_critics
-        self.top_quantiles_to_drop = top_quantiles_to_drop
         self.kappa = kappa
-        self.preserve_distribution = preserve_distribution
         
         # Quantile midpoints
         taus = torch.arange(0, n_quantiles + 1, device=device, dtype=torch.float32) / n_quantiles
@@ -182,40 +162,46 @@ class TOP_TQC_Agent:
 
         self.replay_pool = ReplayPool(capacity=int(buffer_size))
         self._update_counter = 0
-        
-        # For learnable beta: track episode history for meta-learning
-        self.beta_episode_history = []
-        self.beta_history_maxlen = 100
 
-    def update_beta_from_return(self, episode_return: float, baseline: float = 0.0):
-        """Update learnable beta based on episode return (meta-learning)"""
-        if not self.learnable_beta:
-            return
-        
-        current_beta = self.get_beta(detach=False)
-        advantage = episode_return - baseline
-        meta_loss = -current_beta * advantage
-        
-        self.beta_optimizer.zero_grad()
-        meta_loss.backward()
-        torch.nn.utils.clip_grad_norm_([self.beta_param], max_norm=1.0)
-        self.beta_optimizer.step()
-        
-        self.beta_episode_history.append((current_beta.item(), episode_return))
-        if len(self.beta_episode_history) > self.beta_history_maxlen:
-            self.beta_episode_history.pop(0)
-
-    def get_beta(self, detach: bool = True):
-        """Get the current beta value
+    def get_drop_count(self, detach: bool = True):
+        """Get the current number of quantiles to drop
         
         Args:
-            detach: if True, return float for logging; if False, return tensor for gradient
+            detach: if True, return int for logging; if False, return int (no gradient)
+        
+        Returns:
+            int: total number of quantiles to drop across all critics
         """
-        if self.learnable_beta:
-            beta_clamped = torch.clamp(self.beta_param, self.beta_min, self.beta_max)
-            return beta_clamped.item() if detach else beta_clamped
+        if self.learnable_drop:
+            return int(self.current_drop_count)
         else:
-            return self.beta
+            return int(self.top_quantiles_to_drop * self.n_critics)
+    
+    def update_drop_count_from_bandit(self, episode_return: float):
+        """Update drop count based on bandit's learned adjustment
+        
+        Args:
+            episode_return: Total reward from episode (used as bandit feedback)
+        """
+        if not self.learnable_drop:
+            return
+        
+        # Sample adjustment from bandit: -1 (drop fewer), 0 (stay), +1 (drop more)
+        adjustment = self.drop_bandit.sample()
+        
+        # Apply adjustment with bounds
+        new_drop_count = self.current_drop_count + adjustment
+        self.current_drop_count = np.clip(new_drop_count, self.min_drop_count, self.max_drop_count)
+        
+        # Update bandit with feedback (episode return)
+        self.drop_bandit.update(adjustment, episode_return)
+
+    def reallocate_replay_pool(self, new_size: int) -> None:
+        """Reset buffer"""
+        assert new_size != self.replay_pool.capacity, "Error, you've tried to allocate a new pool which has the same length"
+        new_replay_pool = ReplayPool(capacity=new_size)
+        new_replay_pool.initialise(self.replay_pool)
+        self.replay_pool = new_replay_pool
 
     def get_action(
         self,
@@ -250,14 +236,9 @@ class TOP_TQC_Agent:
         nextstate_batch: torch.Tensor,
         done_batch: torch.Tensor,
         beta: float,
-        preserve_distribution: bool = False
+        drop_count: int
     ):
-        """Compute quantile losses for TQC critics with TOP optimism
-        
-        Args:
-            preserve_distribution: If True, applies optimism to distribution directly.
-                                  If False (default), uses scalar belief (original behavior).
-        """
+        """Compute quantile losses for TQC critics with learned quantile dropping"""
         with torch.no_grad():
             # Get next action from target network
             nextaction_batch = self.target_policy(nextstate_batch)
@@ -272,88 +253,69 @@ class TOP_TQC_Agent:
             # Stack: [batch_size, n_critics * n_quantiles]
             next_quantiles_all = torch.cat(next_quantiles_list, dim=1)
             
-            # TQC: Apply truncation (drop highest quantiles for conservatism)
+            # TQC: Apply truncation using current drop count
             sorted_quantiles, _ = torch.sort(next_quantiles_all, dim=1)
-            n_quantiles_to_drop = self.top_quantiles_to_drop * self.n_critics
-            if n_quantiles_to_drop > 0:
-                truncated_quantiles = sorted_quantiles[:, :-n_quantiles_to_drop]  # [batch_size, remaining_quantiles]
+            if drop_count > 0:
+                truncated_quantiles = sorted_quantiles[:, :-drop_count]
             else:
                 truncated_quantiles = sorted_quantiles
             
-            if preserve_distribution:
-                # NEW: Apply optimism while preserving distribution
-                sigma = torch.std(truncated_quantiles, dim=1, keepdim=True) + 1e-4
-                optimistic_quantiles = truncated_quantiles + beta * sigma  # [batch_size, remaining_quantiles]
-                
-                # Resample/interpolate to match critic's n_quantiles
-                if optimistic_quantiles.shape[1] != self.n_quantiles:
-                    # Linear interpolation to n_quantiles
-                    indices = torch.linspace(0, optimistic_quantiles.shape[1] - 1, self.n_quantiles, device=device)
-                    indices_floor = indices.long()
-                    indices_ceil = (indices_floor + 1).clamp(max=optimistic_quantiles.shape[1] - 1)
-                    weight = indices - indices_floor.float()
-                    belief_dist = optimistic_quantiles[:, indices_floor] * (1 - weight) + \
-                                 optimistic_quantiles[:, indices_ceil] * weight
-                else:
-                    belief_dist = optimistic_quantiles
-                
-                # Compute targets
-                quantile_target = reward_batch[..., None] + (1.0 - done_batch[..., None]) * \
-                                self.gamma * belief_dist[:, None, :]  # [batch_size, 1, n_quantiles]
-            else:
-                # ORIGINAL: Collapse to scalar (current behavior)
-                mu = torch.mean(truncated_quantiles, dim=1, keepdim=True)  # [batch_size, 1]
-                sigma = torch.std(truncated_quantiles, dim=1, keepdim=True) + 1e-4  # [batch_size, 1]
-                
-                # Apply TOP's optimism control to TQC's conservative estimate
-                belief_value = mu + beta * sigma  # [batch_size, 1]
-                
-                # Expand to match quantile dimension for target computation
-                belief_dist = belief_value.expand(-1, self.n_quantiles)  # [batch_size, n_quantiles]
-                
-                # Compute targets
-                quantile_target = reward_batch[..., None] + (1.0 - done_batch[..., None]) * \
-                                self.gamma * belief_dist[:, None, :]  # [batch_size, 1, n_quantiles]
-
-        # Get current quantiles from each critic
-        current_quantiles_list = self.q_funcs(state_batch, action_batch)
+            # Compute mean and std of truncated quantiles
+            mu = torch.mean(truncated_quantiles, dim=1, keepdim=True)
+            sigma = torch.std(truncated_quantiles, dim=1, keepdim=True) + 1e-4
+            
+            # Apply TOP optimism
+            belief_scalar = mu + beta * sigma  # [batch_size, 1]
+            
+            # Broadcast to n_quantiles for target -> shape [batch_size, n_quantiles]
+            quantile_target = reward_batch + (1.0 - done_batch) * self.gamma * belief_scalar.squeeze(1)
+            # quantile_target now has shape [batch_size, n_quantiles]
         
-        # Compute loss for each critic
+        # Get current Q estimates from each critic
+        quantiles_list = self.q_funcs(state_batch, action_batch)
+        
         total_loss = 0
-        for current_quantiles in current_quantiles_list:
-            # Compute td errors
-            td_errors = quantile_target - current_quantiles[..., None]  # [batch_size, n_quantiles, n_quantiles]
+        for quantiles in quantiles_list:
+            # quantiles: [batch_size, n_quantiles]
+            # quantile_target: [batch_size, n_quantiles]
+            # Compute TD errors with shape [batch_size, N, N_dash]
+            td_errors = quantile_target.unsqueeze(1) - quantiles.unsqueeze(2)  # [batch, n_pred, n_target]
+            # Compute quantile loss
             loss = calculate_quantile_huber_loss(td_errors, self.tau_hats, weights=None, kappa=self.kappa)
             total_loss += loss
+        
+        return total_loss, quantiles_list
 
-        return total_loss, current_quantiles_list
-
-    def update_policy(self, state_batch: torch.Tensor, beta) -> torch.Tensor:
+    def update_policy(self, state_batch: torch.Tensor, beta: float, drop_count: int) -> torch.Tensor:
         """Update the actor with TOP optimism
         
         Args:
             state_batch: batch of states
-            beta: optimism parameter (float or tensor if learnable for gradient flow)
+            beta: optimism parameter
+            drop_count: number of quantiles to drop (integer, no gradient)
         """
         action_batch = self.policy(state_batch)
         quantiles_list = self.q_funcs(state_batch, action_batch)
         
-        # Stack quantiles from all critics
-        quantiles_all = torch.stack(quantiles_list, dim=-1)  # [batch_size, n_quantiles, n_critics]
-        mu = torch.mean(quantiles_all, dim=-1)  # [batch_size, n_quantiles]
-        sigma = torch.std(quantiles_all, dim=-1) + 1e-4  # [batch_size, n_quantiles]
+        # Stack and sort all quantiles
+        quantiles_all = torch.cat(quantiles_list, dim=1)  # [batch, n_critics * n_quantiles]
+        sorted_quantiles, _ = torch.sort(quantiles_all, dim=1)
         
-        # Apply optimism (beta keeps gradient if tensor)
-        belief_dist = mu + beta * sigma  # [batch_size, n_quantiles]
+        # Drop top quantiles (conservative)
+        if drop_count > 0:
+            truncated_quantiles = sorted_quantiles[:, :-drop_count]
+        else:
+            truncated_quantiles = sorted_quantiles
+        
+        # Weighted mean (equal weights for now)
+        truncated_quantiles_weighted = torch.mean(truncated_quantiles, dim=1, keepdim=True)
+        
+        # Optimism
+        sigma = torch.std(sorted_quantiles, dim=1, keepdim=True) + 1e-4
+        belief = truncated_quantiles_weighted + beta * sigma
         
         # DPG loss
-        qval_batch = torch.mean(belief_dist, dim=-1)
-        policy_loss = (-qval_batch).mean()
-        
-        # Add regularization for learnable beta to prevent extreme values
-        if self.learnable_beta and not isinstance(beta, float):
-            beta_reg = 0.01 * (beta ** 2)  # L2 penalty on beta
-            policy_loss = policy_loss + beta_reg
+        policy_loss = (-belief).mean()
         
         return policy_loss
 
@@ -374,16 +336,17 @@ class TOP_TQC_Agent:
             else:
                 state_batch = torch.FloatTensor(samples.state).to(device)
                 nextstate_batch = torch.FloatTensor(samples.nextstate).to(device)
-            action_batch = torch.FloatTensor(samples.action).to(device)
+            # Convert list-of-arrays to a single numpy array first (faster tensor creation)
+            action_batch = torch.FloatTensor(np.array(samples.action)).to(device)
             reward_batch = torch.FloatTensor(samples.reward).to(device).unsqueeze(1)
             done_batch = torch.FloatTensor(samples.real_done).to(device).unsqueeze(1)
 
-            # Get current beta (detached for critic update)
-            current_beta = self.get_beta(detach=True) if self.learnable_beta else beta
+            # Get current drop count (detached for critic update)
+            current_drop_count = self.get_drop_count(detach=True) if self.learnable_drop else int(self.top_quantiles_to_drop * self.n_critics)
 
             # Update critics
             q_loss_step, quantiles_list = self.update_q_functions(
-                state_batch, action_batch, reward_batch, nextstate_batch, done_batch, current_beta, self.preserve_distribution
+                state_batch, action_batch, reward_batch, nextstate_batch, done_batch, beta, current_drop_count
             )
 
             self.q_optimizer.zero_grad()
@@ -405,16 +368,13 @@ class TOP_TQC_Agent:
                 for p in self.q_funcs.parameters():
                     p.requires_grad = False
 
-                # Always use detached beta - policy gradient shouldn't update beta
-                policy_beta = self.get_beta(detach=True)
-                pi_loss_step = self.update_policy(state_batch, policy_beta)
+                # Always use detached drop count - no gradient through drop parameter
+                policy_drop_count = self.get_drop_count(detach=True) if self.learnable_drop else int(self.top_quantiles_to_drop * self.n_critics)
+                pi_loss_step = self.update_policy(state_batch, beta, policy_drop_count)
 
                 self.policy_optimizer.zero_grad()
-
                 pi_loss_step.backward()
-                # Clip gradients to prevent explosion
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
-                
                 self.policy_optimizer.step()
 
                 for p in self.q_funcs.parameters():
@@ -423,4 +383,6 @@ class TOP_TQC_Agent:
                 self.update_target()
                 pi_loss += pi_loss_step.detach().item()
 
-        return q_loss_total, pi_loss, wd / n_updates, quantiles_list[0], quantiles_list[1] if len(quantiles_list) > 1 else quantiles_list[0]
+        # Compute final quantiles for logging
+        final_quantiles = quantiles_list[0] if quantiles_list else None
+        return q_loss_total, pi_loss, wd / n_updates, final_quantiles, final_quantiles

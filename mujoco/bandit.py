@@ -83,3 +83,24 @@ class ExpWeights(object):
         self.w[self.arm] += self.lr * (feedback/max(np.exp(self.w[self.arm]), 0.0001))
         
         self.data.append(feedback)
+
+    def update(self, arm_value: float, reward: float) -> None:
+        """Compatibility wrapper used by trainers.
+
+        Trainers call `update(beta, episode_return)`; interpret `arm_value`
+        as the chosen arm's value, set the internal `arm` index accordingly,
+        and forward the `reward` as feedback to `update_dists`.
+        """
+        # Find the closest arm index for the provided arm_value
+        try:
+            # exact match first
+            idx = self.arms.index(arm_value)
+        except ValueError:
+            # fallback to nearest numeric match
+            arr = np.array(self.arms, dtype=float)
+            idx = int(np.argmin(np.abs(arr - float(arm_value))))
+
+        self.arm = idx
+        self.value = self.arms[self.arm]
+        # Use reward as feedback (trainers provide episode return)
+        self.update_dists(float(reward))
