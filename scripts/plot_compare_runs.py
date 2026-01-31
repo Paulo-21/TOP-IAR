@@ -22,6 +22,23 @@ PREFERRED_TAGS = [
     "mean_return",
 ]
 
+# Improve default plot readability for small thumbnails and force no axis margins
+plt.rcParams.update({
+    'figure.dpi': 120,
+    'savefig.dpi': 200,
+    'font.size': 18,
+    'axes.titlesize': 20,
+    'axes.labelsize': 18,
+    'legend.fontsize': 16,
+    'xtick.labelsize': 14,
+    'ytick.labelsize': 14,
+    'lines.linewidth': 3.2,
+    'lines.markersize': 9,
+    'grid.linewidth': 0.7,
+    'axes.xmargin': 0.0,
+    'axes.ymargin': 0.0,
+})
+
 
 def find_runs(root_dir):
     """Find runs under the new layout: <root_dir>/<algorithm>/<env>[/tensorboard]
@@ -54,7 +71,12 @@ def find_runs(root_dir):
                 if glob.glob(os.path.join(env_dir, 'events.out.tfevents.*')):
                     candidate = env_dir
             if candidate:
-                runs.append({'path': candidate, 'algorithm': algo, 'env': env})
+                # normalize algorithm display name for readability in plots
+                algorithm_display = algo
+                # map only the exact learnable-quantiles folder to avoid merging other 'top_tqc' variants
+                if 'top_tqc_learnable_quantiles' in algo:
+                    algorithm_display = 'tqc_top_quantiles'
+                runs.append({'path': candidate, 'algorithm': algorithm_display, 'env': env})
 
         # Legacy / alternative layout: event files directly under algo_dir
         # e.g. runs/<algorithm>/events.out.tfevents.*  -> try to infer env and include
@@ -74,7 +96,10 @@ def find_runs(root_dir):
                             inferred_env = e
                             break
                 if inferred_env:
-                    runs.append({'path': algo_dir, 'algorithm': algo, 'env': inferred_env})
+                    algorithm_display = algo
+                    if 'top_tqc_learnable_quantiles' in algo:
+                        algorithm_display = 'tqc_top_quantiles'
+                    runs.append({'path': algo_dir, 'algorithm': algorithm_display, 'env': inferred_env})
                 else:
                     # unable to infer environment name reliably — skip but notify
                     print(f"Skipping {algo_dir}: no env subfolder and could not infer environment name from '{algo}'.")
@@ -251,38 +276,40 @@ def plot_env(data_for_env, env_name, out_dir="plots"):
     os.makedirs(out_dir, exist_ok=True)
     plt.figure(figsize=(10, 6))
 
+    # fixed x grid across all plots: 0 .. 1e6
+    xs = np.linspace(0.0, 1e6, 300)
     for alg, runs in sorted(data_for_env.items()):
-        # compute common x grid
-        min_step = min([r[0].min() for r in runs])
-        max_step = max([r[0].max() for r in runs])
-        if max_step <= min_step:
-            xs = runs[0][0]
-            ys_mean = runs[0][1]
-            ys_std = np.zeros_like(ys_mean)
-        else:
-            xs = np.linspace(min_step, max_step, 300)
-            interp_vals = []
-            for steps, vals in runs:
-                # require at least two points to interpolate
-                if len(steps) == 1:
-                    interp_vals.append(np.full_like(xs, vals[0]))
-                else:
-                    interp_vals.append(np.interp(xs, steps, vals))
-            arr = np.vstack(interp_vals)
-            ys_mean = arr.mean(axis=0)
-            ys_std = arr.std(axis=0)
+        interp_vals = []
+        for steps, vals in runs:
+            # extend values to full [0,1e6] via constant extrapolation at ends
+            if len(steps) == 0:
+                continue
+            if len(steps) == 1:
+                interp_vals.append(np.full_like(xs, vals[0]))
+            else:
+                interp_vals.append(np.interp(xs, steps, vals, left=vals[0], right=vals[-1]))
+        if not interp_vals:
+            continue
+        arr = np.vstack(interp_vals)
+        ys_mean = arr.mean(axis=0)
+        ys_std = arr.std(axis=0)
+        p10 = np.percentile(arr, 10, axis=0)
+        p90 = np.percentile(arr, 90, axis=0)
 
-        plt.plot(xs, ys_mean, label=f"{alg} (n={len(runs)})")
-        plt.fill_between(xs, ys_mean - ys_std, ys_mean + ys_std, alpha=0.2)
+        line, = plt.plot(xs, ys_mean, label=f"{alg} (n={len(runs)})", linewidth=plt.rcParams['lines.linewidth'])
+        color = line.get_color()
+        # band: 10th-90th percentiles
+        plt.fill_between(xs, p10, p90, color=color, alpha=0.15, linewidth=0)
 
     plt.title(f"Comparison on {env_name}")
     plt.xlabel("Step")
     plt.ylabel("Return")
-    plt.legend()
+    plt.legend(loc='best', framealpha=0.9)
     plt.grid(True)
+    plt.xlim(0, 1e6)
     out_file = os.path.join(out_dir, f"{env_name}.png")
     plt.tight_layout()
-    plt.savefig(out_file)
+    plt.savefig(out_file, dpi=plt.rcParams['savefig.dpi'], bbox_inches='tight')
     plt.close()
     print(f"Wrote plot: {out_file}")
 
@@ -298,37 +325,39 @@ def plot_env_for_tag(data_for_env, env_name, tag, out_dir="plots"):
     os.makedirs(out_dir, exist_ok=True)
     plt.figure(figsize=(10, 6))
 
+    # fixed x grid 0..1e6 for diagnostics as well
+    xs = np.linspace(0.0, 1e6, 300)
     for alg, runs in sorted(data_for_env.items()):
-        min_step = min([r[0].min() for r in runs])
-        max_step = max([r[0].max() for r in runs])
-        if max_step <= min_step:
-            xs = runs[0][0]
-            ys_mean = runs[0][1]
-            ys_std = np.zeros_like(ys_mean)
-        else:
-            xs = np.linspace(min_step, max_step, 300)
-            interp_vals = []
-            for steps, vals in runs:
-                if len(steps) == 1:
-                    interp_vals.append(np.full_like(xs, vals[0]))
-                else:
-                    interp_vals.append(np.interp(xs, steps, vals))
-            arr = np.vstack(interp_vals)
-            ys_mean = arr.mean(axis=0)
-            ys_std = arr.std(axis=0)
+        interp_vals = []
+        for steps, vals in runs:
+            if len(steps) == 0:
+                continue
+            if len(steps) == 1:
+                interp_vals.append(np.full_like(xs, vals[0]))
+            else:
+                interp_vals.append(np.interp(xs, steps, vals, left=vals[0], right=vals[-1]))
+        if not interp_vals:
+            continue
+        arr = np.vstack(interp_vals)
+        ys_mean = arr.mean(axis=0)
+        ys_std = arr.std(axis=0)
+        p10 = np.percentile(arr, 10, axis=0)
+        p90 = np.percentile(arr, 90, axis=0)
 
-        plt.plot(xs, ys_mean, label=f"{alg} (n={len(runs)})")
-        plt.fill_between(xs, ys_mean - ys_std, ys_mean + ys_std, alpha=0.2)
+        line, = plt.plot(xs, ys_mean, label=f"{alg} (n={len(runs)})", linewidth=plt.rcParams['lines.linewidth'])
+        color = line.get_color()
+        plt.fill_between(xs, p10, p90, color=color, alpha=0.15, linewidth=0)
 
     plt.title(f"{tag} on {env_name}")
     plt.xlabel("Step")
     plt.ylabel(tag)
-    plt.legend()
+    plt.legend(loc='best', framealpha=0.9)
     plt.grid(True)
+    plt.xlim(0, 1e6)
     safe = sanitize_tag(tag)
     out_file = os.path.join(out_dir, f"{env_name}_{safe}.png")
     plt.tight_layout()
-    plt.savefig(out_file)
+    plt.savefig(out_file, dpi=plt.rcParams['savefig.dpi'], bbox_inches='tight')
     plt.close()
     print(f"Wrote plot: {out_file}")
 
@@ -368,6 +397,15 @@ def main():
             for env in ENVIRONMENTS:
                 if env in arm_data and arm_data[env]:
                     plot_env_for_tag(arm_data[env], env, tag, out_dir=args.out_dir)
+    
+    # Plot drop count metrics for learnable quantile dropping
+    drop_count_tags = ['train/drop_count_total', 'train/drop_count_per_critic', 
+                       'agent/drop_count_total', 'agent/drop_count_per_critic']
+    for tag in drop_count_tags:
+        drop_data = gather_data_for_tag(args.runs_dirs, tag)
+        for env in ENVIRONMENTS:
+            if env in drop_data and drop_data[env]:
+                plot_env_for_tag(drop_data[env], env, tag, out_dir=args.out_dir)
 
 
 if __name__ == '__main__':
