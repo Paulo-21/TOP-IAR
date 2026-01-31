@@ -122,7 +122,6 @@ class TOP_TQC_LearnableDrop_Agent:
         if learnable_drop:
             # Start with initial drop count
             self.current_drop_count = top_quantiles_to_drop * n_critics
-            # Bandit for adjusting drop count: arms = [-1, 0, +1] (remove drop, stay, add drop)
             self.drop_bandit = ExpWeights(arms=[-1, 0, 1], lr=drop_lr, init=0.0, use_std=True)
             # Bounds: drop at least 0, at most 50% of total quantiles
             self.min_drop_count = 0
@@ -152,9 +151,6 @@ class TOP_TQC_LearnableDrop_Agent:
         # Quantile midpoints
         taus = torch.arange(0, n_quantiles + 1, device=device, dtype=torch.float32) / n_quantiles
         self.tau_hats = ((taus[1:] + taus[:-1]) / 2.0).view(1, n_quantiles)
-
-        # Bandit top-down controller
-        self.TDC = ExpWeights(arms=[-1, 0], lr=bandit_lr, init=0.0, use_std=True)
 
         # Optimizers
         self.q_optimizer = torch.optim.Adam(self.q_funcs.parameters(), lr=lr)
@@ -266,10 +262,10 @@ class TOP_TQC_LearnableDrop_Agent:
             
             # Apply TOP optimism
             belief_scalar = mu + beta * sigma  # [batch_size, 1]
-            
-            # Broadcast to n_quantiles for target -> shape [batch_size, n_quantiles]
-            quantile_target = reward_batch + (1.0 - done_batch) * self.gamma * belief_scalar.squeeze(1)
-            # quantile_target now has shape [batch_size, n_quantiles]
+            # Expand belief to per-quantile targets to match quantile regression shape
+            belief_dist = belief_scalar.expand(-1, self.n_quantiles)  # [batch_size, n_quantiles]
+            quantile_target = reward_batch + (1.0 - done_batch) * self.gamma * belief_dist
+            # quantile_target has shape [batch_size, n_quantiles]
         
         # Get current Q estimates from each critic
         quantiles_list = self.q_funcs(state_batch, action_batch)

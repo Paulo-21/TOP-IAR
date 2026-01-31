@@ -246,7 +246,7 @@ ALGORITHMS = {
 }
 
 ENVIRONMENTS = ['HalfCheetah-v5', 'Hopper-v5']
-SEEDS = [1, 2, 3, 4, 5]
+SEEDS = [4, 5]
 
 
 def generate_experiments() -> List[Dict]:

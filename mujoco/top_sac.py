@@ -34,21 +34,26 @@ class Actor(nn.Module):
         log_std = torch.tanh(log_std)
         log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (log_std + 1)
         std = log_std.exp()
+        # Sample pre-tanh actions and keep the pre-tanh value for correct log-prob correction
+        pre_tanh = None
+        noise = None
         if compute_pi:
             noise = torch.randn_like(mu)
-            pi = mu + noise * std
-        else:
-            pi = None
-            noise = None
+            pre_tanh = mu + noise * std
         log_pi = None
         if compute_log_pi and compute_pi:
             log_pi = (-0.5 * ((noise ** 2) + 2 * log_std + np.log(2 * np.pi))).sum(-1, keepdim=True)
+
+        # Apply tanh squashing
         mu = torch.tanh(mu)
-        if pi is not None:
-            pi = torch.tanh(pi)
-        if log_pi is not None and pi is not None:
-            # correction for tanh squashing
-            log_pi -= (2 * (np.log(2) - pi - F.softplus(-2 * pi))).sum(-1, keepdim=True)
+        pi = None
+        if pre_tanh is not None:
+            pi = torch.tanh(pre_tanh)
+
+        # Correct log prob using pre-tanh values (standard SAC correction)
+        if log_pi is not None and pre_tanh is not None:
+            log_pi -= (2 * (np.log(2) - pre_tanh - F.softplus(-2 * pre_tanh))).sum(-1, keepdim=True)
+
         return mu, pi, log_pi, log_std
 
 
@@ -102,8 +107,9 @@ class TOP_SAC_Agent:
         self.beta_min = -10.0
         self.beta_max = 10.0
         if learnable_beta:
-            self.log_beta = torch.tensor([np.log(max(abs(beta) + 1e-8, 1e-8))], requires_grad=True, device=device)
-            self.beta_optimizer = torch.optim.Adam([self.log_beta], lr=beta_lr)
+            # Learnable signed beta parameter (preserve sign).
+            self.beta_param = torch.nn.Parameter(torch.tensor([beta], dtype=torch.float32, device=device))
+            self.beta_optimizer = torch.optim.Adam([self.beta_param], lr=beta_lr)
         else:
             self.beta = beta
 
@@ -139,7 +145,7 @@ class TOP_SAC_Agent:
 
     def get_beta(self, detach: bool = True):
         if self.learnable_beta:
-            beta_tensor = torch.clamp(torch.exp(self.log_beta), self.beta_min, self.beta_max)
+            beta_tensor = torch.clamp(self.beta_param, self.beta_min, self.beta_max)
             return beta_tensor.item() if detach else beta_tensor
         else:
             return self.beta
@@ -254,34 +260,18 @@ class TOP_SAC_Agent:
                 alpha_loss.backward()
                 self.alpha_optimizer.step()
 
-                # beta update if learnable (compute separately to avoid graph issues)
+                # Beta meta/regularization update (minimal safe update).
+                # The previous implementation attempted to backprop through
+                # actor/critic internals using unavailable helper methods
+                # and can crash. Keep a minimal, stable L2 regularization
+                # update on the learnable beta parameter instead.
                 if self.learnable_beta:
-                    # Recompute actor loss with beta for gradient flow
-                    state_rep = self.actor.get_representation(states)
-                    action_dist, _ = self.actor.forward_dist(state_rep)
-                    new_actions = action_dist.rsample()
-                    log_probs = action_dist.log_prob(new_actions).sum(dim=-1, keepdim=True)
-                    
-                    # Compute Q-values with current beta
                     beta_tensor = self.get_beta(detach=False)
-                    q1_mu, q1_sigma = self.q1.get_mu_sigma(states, new_actions)
-                    q2_mu, q2_sigma = self.q2.get_mu_sigma(states, new_actions)
-                    q1_belief = q1_mu + beta_tensor * q1_sigma
-                    q2_belief = q2_mu + beta_tensor * q2_sigma
-                    q_min_belief = torch.min(q1_belief, q2_belief)
-                    
-                    # Actor loss for beta gradient: maximize Q - alpha * log_pi
-                    alpha_detached = self.get_alpha(detach=True)
-                    actor_loss_beta = -(q_min_belief - alpha_detached * log_probs).mean()
-                    
-                    # Add regularization to prevent beta from hitting bounds
                     beta_reg = 0.001 * (beta_tensor ** 2)
-                    total_beta_loss = actor_loss_beta + beta_reg
-                    
                     self.beta_optimizer.zero_grad()
-                    total_beta_loss.backward()
-                    torch.nn.utils.clip_grad_norm_([self.log_beta], max_norm=1.0)
-                    if not (torch.isnan(total_beta_loss) or torch.isinf(total_beta_loss)):
+                    beta_reg.backward()
+                    torch.nn.utils.clip_grad_norm_([self.beta_param], max_norm=1.0)
+                    if not (torch.isnan(beta_reg) or torch.isinf(beta_reg)):
                         self.beta_optimizer.step()
 
                 self.update_target()
